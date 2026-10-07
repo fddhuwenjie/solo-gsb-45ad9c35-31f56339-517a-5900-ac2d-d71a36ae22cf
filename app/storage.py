@@ -48,10 +48,20 @@
   账户内冲正次序连续。被冲正收款的逐凭证核销在头寸重算时不再计入有效
   实收（原收款主行与核销行本身保留，永不改写）；冲正核对失败（原单不
   存在、账户不符）一律回滚，本表不写。
+- account_credit_transfers 为账户间已形成信用的划转：transfer_no 为调用方
+  提交的全平台唯一划转单号（主键），整行冻结首次成功时的完整回执 JSON
+  （双方账户、划转金额、目标按入账顺序的逐凭证抵扣、划转后双方头寸快照
+  与时间）；同一单号 + 同来源 + 同目标 + 同金额重试原样取回首次回执，
+  单号换账户或换金额判 409；global_seq 为全平台划转次序，
+  (from_account_id, from_transfer_seq) / (to_account_id, to_transfer_seq)
+  两个唯一键分别保证划出 / 转入两方账户内划转次序连续、不重号。转入额在
+  头寸重算时加入应退池（不产生现金核销、不计入累计实收），划出额从池中
+  扣除（与退付同口径）；信用不足、账户不合要求时整笔拒绝、本表不写。
 - 旧库只有 sessions / session_records 两张表时，session_batches、
   session_revisions、session_settlement_vouchers、account_ledger_entries、
-  account_payments、account_payment_allocations、account_payouts 与
-  account_payment_reversals 由 CREATE TABLE IF NOT EXISTS 自动补齐
+  account_payments、account_payment_allocations、account_payouts、
+  account_payment_reversals 与 account_credit_transfers 由
+  CREATE TABLE IF NOT EXISTS 自动补齐
   （空表）：查询与从 next_index 续报不受影响；已确认区间内没有批次边界
   可核对，不按前缀猜测去重。
 """
@@ -69,7 +79,8 @@ from typing import Iterator, List, Optional
 # （存每次提交的原始变更与叠加后的整段修订台账）；session_settlement_vouchers
 # 为逐版结算凭证表（冻结该版台账、完整结算结果与首单/补退计费），均为后加的
 # 新表，旧库打开时由 IF NOT EXISTS 自动补建。account_payouts 为信用退付表、
-# account_payment_reversals 为收款冲正表，同样由 IF NOT EXISTS 自动补建。
+# account_payment_reversals 为收款冲正表、account_credit_transfers 为账户间
+# 信用划转表，同样由 IF NOT EXISTS 自动补建。
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
     session_id TEXT PRIMARY KEY,
@@ -201,6 +212,28 @@ CREATE TABLE IF NOT EXISTS account_payment_reversals (
 );
 CREATE INDEX IF NOT EXISTS idx_reversals_account_order
     ON account_payment_reversals(account_id, reversal_seq);
+CREATE TABLE IF NOT EXISTS account_credit_transfers (
+    transfer_id TEXT NOT NULL,
+    transfer_no TEXT NOT NULL,
+    global_seq INTEGER NOT NULL,
+    from_account_id TEXT NOT NULL,
+    to_account_id TEXT NOT NULL,
+    from_transfer_seq INTEGER NOT NULL,
+    to_transfer_seq INTEGER NOT NULL,
+    amount_yuan REAL NOT NULL,
+    receipt_json TEXT NOT NULL,
+    transferred_at TEXT NOT NULL,
+    PRIMARY KEY (transfer_no),
+    UNIQUE (global_seq),
+    UNIQUE (from_account_id, from_transfer_seq),
+    UNIQUE (to_account_id, to_transfer_seq)
+);
+CREATE INDEX IF NOT EXISTS idx_transfers_from_order
+    ON account_credit_transfers(from_account_id, from_transfer_seq);
+CREATE INDEX IF NOT EXISTS idx_transfers_to_order
+    ON account_credit_transfers(to_account_id, to_transfer_seq);
+CREATE INDEX IF NOT EXISTS idx_transfers_global_order
+    ON account_credit_transfers(global_seq);
 """
 
 # 台账表后加列时的轻量迁移：旧库已建表但缺列，按列名幂等 ALTER 补齐。
@@ -912,6 +945,124 @@ class SessionStore:
                     "SELECT * FROM account_payment_reversals"
                     " WHERE account_id = ? ORDER BY reversal_seq",
                     (account_id,),
+                ).fetchall()
+            )
+
+    # ------------------------------------------------------------------
+    # 账户间信用划转（划转单幂等；划出扣减应退池、转入加入应退池）
+    # ------------------------------------------------------------------
+
+    def get_transfer(self, conn: sqlite3.Connection, transfer_no: str) -> Optional[sqlite3.Row]:
+        """写事务内按全平台唯一划转单号取划转行；从未提交过返回 None。"""
+        return conn.execute(
+            "SELECT * FROM account_credit_transfers WHERE transfer_no = ?",
+            (transfer_no,),
+        ).fetchone()
+
+    def count_transfers(self) -> int:
+        """全平台已落盘划转笔数（global_seq 从 1 起）。"""
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS c FROM account_credit_transfers"
+            ).fetchone()
+            return int(row["c"])
+
+    def count_transfers_in_txn(self, conn: sqlite3.Connection) -> int:
+        """写事务内取全平台已落盘划转笔数（用于分配下一个 global_seq）。"""
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM account_credit_transfers"
+        ).fetchone()
+        return int(row["c"])
+
+    def count_transfers_for_account(
+        self, conn: sqlite3.Connection, account_id: str
+    ) -> tuple:
+        """写事务内取账户参与的划转笔数（划出与转入分别计数后的较大序号基数）。
+
+        from_transfer_seq / to_transfer_seq 各自从 1 起连续：本笔在一方的
+        序号 = 该方在对应方向的已落盘笔数 + 1。
+
+        两个子查询的位置参数若都用 ? 会按 SQL 文本顺序跨子查询绑定，
+        故用命名参数 :acct 明确各取同一账户值。
+        """
+        row = conn.execute(
+            "SELECT (SELECT COUNT(*) FROM account_credit_transfers"
+            "         WHERE from_account_id = :acct) AS c_from,"
+            " (SELECT COUNT(*) FROM account_credit_transfers"
+            "         WHERE to_account_id = :acct) AS c_to",
+            {"acct": account_id},
+        ).fetchone()
+        return int(row["c_from"]), int(row["c_to"])
+
+    def sum_transfer_flows(
+        self, conn: sqlite3.Connection, account_id: str
+    ) -> tuple:
+        """写事务内汇总账户已落盘的划出额与转入额（头寸重算时进出应退池）。
+
+        两个子查询的位置参数若都用 ? 会按 SQL 文本顺序跨子查询绑定，
+        故用命名参数 :acct 明确各取同一账户值。
+        """
+        row = conn.execute(
+            "SELECT"
+            " COALESCE((SELECT SUM(amount_yuan) FROM account_credit_transfers"
+            "           WHERE from_account_id = :acct), 0.0) AS sent,"
+            " COALESCE((SELECT SUM(amount_yuan) FROM account_credit_transfers"
+            "           WHERE to_account_id = :acct), 0.0) AS received",
+            {"acct": account_id},
+        ).fetchone()
+        return float(row["sent"]), float(row["received"])
+
+    def insert_transfer(
+        self,
+        conn: sqlite3.Connection,
+        transfer_id: str,
+        transfer_no: str,
+        global_seq: int,
+        from_account_id: str,
+        to_account_id: str,
+        from_transfer_seq: int,
+        to_transfer_seq: int,
+        amount_yuan: float,
+        receipt_json: str,
+        transferred_at: str,
+    ) -> None:
+        """与「双方头寸核对 → 信用检查 → 目标 FIFO 抵扣」同一事务原子落盘。
+
+        transfer_no 主键在数据库层兜底：并发同一单号只有一笔成功落盘；
+        global_seq 唯一键保证全平台划转次序不重号，(from_account_id,
+        from_transfer_seq) / (to_account_id, to_transfer_seq) 两个唯一键
+        保证两户各自的划出 / 转入次序连续。
+        """
+        conn.execute(
+            "INSERT INTO account_credit_transfers"
+            "(transfer_id, transfer_no, global_seq, from_account_id, to_account_id,"
+            " from_transfer_seq, to_transfer_seq, amount_yuan, receipt_json,"
+            " transferred_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                transfer_id,
+                transfer_no,
+                global_seq,
+                from_account_id,
+                to_account_id,
+                from_transfer_seq,
+                to_transfer_seq,
+                amount_yuan,
+                receipt_json,
+                transferred_at,
+            ),
+        )
+
+    def list_transfer_rows_for_account(self, account_id: str) -> List[sqlite3.Row]:
+        """按全平台划转次序（global_seq 升序）列出账户作为划出方或转入方
+        参与的全部划转行（GET /accounts/{id}/credit-transfers 用）。"""
+        with self._lock, self._connect() as conn:
+            return list(
+                conn.execute(
+                    "SELECT * FROM account_credit_transfers"
+                    " WHERE from_account_id = ? OR to_account_id = ?"
+                    " ORDER BY global_seq",
+                    (account_id, account_id),
                 ).fetchall()
             )
 
