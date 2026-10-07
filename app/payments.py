@@ -27,18 +27,22 @@
 
 当前尚欠 / 信用重算（对账户全部已记明细）：
 - 先把账户内**全部已记应退**（无论其入账在正额凭证之前还是之后）汇成一个
-  应退池，并**先扣除全部已落盘退付**（退付只动信用、不动逐凭证核销），
-  再按原入账顺序（entry_no 升序）逐张处理正额凭证：
+  应退池，**先扣除全部已落盘退付与已落盘划出信用**（退付与划出都只动信用、
+  不动逐凭证现金核销），**再加回全部已落盘划入信用**（账户间划转转入，
+  不是现金实收），再按原入账顺序（entry_no 升序）逐张处理正额凭证：
   每张正额凭证上，已落盘且**未被冲正**的收款核销（有效现金）先受保护，
   池子只抵减「应收 − 有效已收款」的未核销部分
   （applied = min(剩余池, 应收 − 有效已收款)），抵减后其余额即该凭证最新尚欠；
 - 遍历结束后池中剩余即账户信用 credit_yuan；
   全部正额凭证尚欠之和即 outstanding_yuan（与信用不同时为正）。
-这套「当前重算」只读取冻结的现金核销与已落盘退付，从不改写它们：后来补退
-只会增大池子、改变最新尚欠/信用（现金已付清的凭证直接被池子越过），
-旧收款分配与旧退付回执原样保留。退付在池中最先扣除：退付时刻已核验
-「退付 ≤ 当时信用」，故池不会为负，且退付本身不改变任何凭证的尚欠；
-之后入账的应补/应退仍按同一口径与已扣退付的池子重新抵减。
+这套「当前重算」只读取冻结的现金核销、已落盘退付与已落盘划转，从不改写
+它们：后来补退只会增大池子、改变最新尚欠/信用（现金已付清的凭证直接被
+池子越过），旧收款分配、旧退付回执与旧划转回执原样保留。退付与划出在
+池中最先扣除（落盘时均已核验「金额 ≤ 当时信用」，池不会为负），划入在
+扣除后加回；之后入账的应补/应退仍按同一口径与已扣退付/划出、已加划入的
+池子重新抵减。划转是**账户间信用搬运**：转入额永远不形成现金实收
+（total_received_yuan 只含有效收款），目标户按入账顺序用转入池抵减未付
+凭证、剩余形成信用（见 app/transfers.py）。
 **整笔冲正**（见 app/reversals.py）把误记收款的核销排除出有效实收：
 原收款主行、逐凭证分配与首次收款回执全部保留，只是重算时该笔核销不再
 计入——逐凭证已收、账户累计实收与当前尚欠/信用随之按「有效收款 + 已记
@@ -111,14 +115,18 @@ def account_position(conn, store: SessionStore, account_id: str,
     exclude_payment_nos 用于冲正落盘前预演「冲正后」口径（把待冲正单号
     一并按无效排除）。
     返回 entries（与 ledger 明细同序，附 receivable/refund_applied/paid/
-    outstanding）与账户级 totals（含 total_received_yuan 累计有效实收与
-    total_paid_out_yuan 累计退付）。
+    outstanding）与账户级 totals（含 total_received_yuan 累计有效实收、
+    total_paid_out_yuan 累计退付、total_transferred_out/in_yuan 累计
+    划出/划入信用）。
     """
     rows = store.list_ledger_entry_rows_in_txn(conn, account_id)
-    # 应退池按账户整体汇总（与入账先后无关），先扣除已落盘退付，再按 FIFO
-    # 抵减正额凭证。退付落盘时已核验「退付 ≤ 当时信用」，池不会为负；
-    # 浮点尘埃兜底归零。
+    # 信用池按账户整体汇总（与入账先后无关）：已记应退 − 已落盘退付
+    # − 已落盘划出 + 已落盘划入，再按 FIFO 抵减正额凭证。退付与划出落盘
+    # 时均已核验「金额 ≤ 当时信用」、划入只会加池，池不会为负；
+    # 浮点尘埃兜底归零。划转是信用搬运，划入不计入现金实收。
     total_paid_out = _round6(store.sum_payouts(conn, account_id))
+    total_transferred_out = _round6(store.sum_transfers_out(conn, account_id))
+    total_transferred_in = _round6(store.sum_transfers_in(conn, account_id))
     refund_pool = _round6(
         sum(
             abs(float(r["signed_amount_yuan"]))
@@ -126,6 +134,8 @@ def account_position(conn, store: SessionStore, account_id: str,
             if float(r["signed_amount_yuan"]) < -_EPS
         )
         - total_paid_out
+        - total_transferred_out
+        + total_transferred_in
     )
     if refund_pool < _EPS:
         refund_pool = 0.0
@@ -181,6 +191,8 @@ def account_position(conn, store: SessionStore, account_id: str,
         "credit_yuan": credit,
         "total_received_yuan": total_received,
         "total_paid_out_yuan": total_paid_out,
+        "total_transferred_out_yuan": total_transferred_out,
+        "total_transferred_in_yuan": total_transferred_in,
         "entry_count": len(entries),
     }
     return {"account_id": account_id, "entries": entries, "totals": totals}

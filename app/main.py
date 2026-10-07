@@ -11,6 +11,8 @@ from app.ledger import LedgerError, post_vouchers
 from app.models import (
     BatchAppendRequest,
     BatchAppendResponse,
+    CreditTransferReceiptResponse,
+    CreditTransferRequest,
     DispatchRequest,
     DispatchResponse,
     ErrorResponse,
@@ -39,6 +41,7 @@ from app.models import (
     SettlementVoucherResponse,
     TelemetryAuditRequest,
     TelemetryAuditResponse,
+    TransferListResponse,
     VoucherIssueRequest,
     VoucherListResponse,
 )
@@ -50,6 +53,7 @@ from app.revisions import RevisionError, get_revision, submit_revision
 from app.sessions import SessionError, append_batch, create_session, get_session, list_sessions
 from app.settlement import SettlementError, execute_settlement
 from app.solver import InfeasibleError, solve_dispatch
+from app.transfers import TransferError, list_transfers, submit_transfer
 from app.vouchers import VoucherError, issue_voucher, list_vouchers
 
 app = FastAPI(
@@ -111,8 +115,21 @@ app = FastAPI(
         "同单号同账户同金额重试返回首次回执，换账户或金额返回 409；"
         "信用核对与退付登记和原入账、收款共用同一 SQLite 写事务，"
         "并发不重复支付，重启后记录仍可查。"
+        "/account-transfers 办理账户间已形成信用的划转：提交全平台唯一"
+        "划转单号、来源账户、目标账户与正金额（两户须不同且都已有台账，"
+        "金额不得超过来源当前信用，否则整笔拒绝、双方均不留流水）；"
+        "成功后来源信用扣减，目标按原入账顺序用转入额抵扣尚未付清的"
+        "正额凭证（可部分付清），剩余转入额形成目标信用；转入额不算"
+        "现金实收（不写现金核销、累计实收不变），已记凭证、旧收款分配、"
+        "退付与首次回执均不改写；台账、收款、退付查询及后续收款/退付"
+        "按划转后的两户头寸处理（划出先扣信用池、划入加回再抵减）；"
+        "返回划转金额、时间、目标户逐凭证抵扣与双方划转后最新尚欠/信用，"
+        "并可经 /accounts/{账户ID}/transfers 按账户查询划出与划入记录；"
+        "同单号同双方同金额重试返回首次冻结回执，换账户或金额返回 409；"
+        "双方信用核对与划转落盘共用同一 SQLite 写事务，并发划转和退付"
+        "不得重复支用信用，重启后记录仍可查。"
     ),
-    version="1.11.0",
+    version="1.12.0",
 )
 
 
@@ -223,6 +240,17 @@ async def payout_error_handler(request: Request, exc: PayoutError):
 async def reversal_error_handler(request: Request, exc: ReversalError):
     body = {"error": exc.code, "reason": str(exc)}
     # 附加字段（如原收款单号、原收款所属账户）随错误体顶层返回
+    body.update(exc.extra)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=body,
+    )
+
+
+@app.exception_handler(TransferError)
+async def transfer_error_handler(request: Request, exc: TransferError):
+    body = {"error": exc.code, "reason": str(exc)}
+    # 附加字段（如冲突单号的已登记双方/金额、超额时来源当前信用/尚欠）随错误体顶层返回
     body.update(exc.extra)
     return JSONResponse(
         status_code=exc.status_code,
@@ -737,3 +765,73 @@ async def list_account_payouts(account_id: str) -> PayoutListResponse:
     """
     result = list_payouts(account_id)
     return PayoutListResponse.model_validate(result)
+
+
+# ---------------------------------------------------------------------------
+# 账户间信用划转：来源信用扣减，目标按入账顺序抵欠费、剩余形成信用
+# ---------------------------------------------------------------------------
+
+
+@app.post(
+    "/account-transfers",
+    response_model=CreditTransferReceiptResponse,
+    responses={
+        409: {"model": ErrorResponse, "description": "划转单号已用于别的账户或别的金额"},
+        422: {"model": ErrorResponse, "description": "金额非正、两户相同、账户无台账或划转额超过来源当前信用（整笔拒绝双方均不留流水）"},
+    },
+    tags=["ledger"],
+)
+async def post_account_transfer(req: CreditTransferRequest) -> CreditTransferReceiptResponse:
+    """把来源账户已形成的信用划转到目标账户抵扣欠费（账户级全局接口）。
+
+    - 请求体给出全平台唯一划转单号 transfer_no、来源账户 from_account_id、
+      目标账户 to_account_id 与正金额 amount_yuan；两账户必须不同且都已有
+      台账，划转额不得超过来源**当前信用** credit_yuan；
+    - 成功后**来源信用扣减**划转额（划转不动来源任何凭证的尚欠/已收款）；
+      **目标按原入账顺序**（entry_no 升序）用转入额抵扣尚未付清的正额凭证，
+      可只部分付清一张，抵扣后剩余转入额叠加在目标既有信用上形成新信用；
+      **转入额不算现金实收**：不写现金核销、total_received_yuan 不变，
+      已记凭证、旧收款分配、退付与各首次回执一律不改写；
+    - 台账、收款、退付查询及后续收款/退付都按划转后的两户头寸处理
+      （划出与退付一样先从信用池扣除，划入在扣除后加回再 FIFO 抵减）；
+    - 两户相同 → 422 transfer_same_account；任一账户无台账 → 422
+      transfer_account_no_ledger（错误体附 account_id / side）；划转额超过
+      来源当前信用 → 422 transfer_exceeds_credit（错误体附来源当前
+      credit_yuan / outstanding_yuan），均**整笔拒绝、双方不留任何流水**；
+    - 同一 transfer_no + 同来源 + 同目标 + 同金额重试 → result=deduped，
+      返回首次成功时冻结的回执（逐凭证抵扣、划转时间与双方头寸快照都不
+      漂移）；同一单号换账户或换金额 → 409 transfer_no_conflict，错误体
+      附已登记的 from_account_id / to_account_id / amount_yuan，不写入；
+    - 双方头寸核对、目标逐凭证抵扣与划转落盘与原入账、收款、退付共用同一
+      SQLite 写事务（RLock + BEGIN IMMEDIATE）：transfer_no 主键与两侧
+      (账户, 序号) 唯一键兜底，并发划转与退付不会重复支用同一笔信用，
+      进程重启后记录仍在、重试仍返回首次回执。
+    """
+    result = submit_transfer(
+        from_account_id=req.from_account_id,
+        to_account_id=req.to_account_id,
+        transfer_no=req.transfer_no,
+        amount_yuan=req.amount_yuan,
+    )
+    return CreditTransferReceiptResponse.model_validate(result)
+
+
+@app.get(
+    "/accounts/{account_id}/transfers",
+    response_model=TransferListResponse,
+    tags=["ledger"],
+)
+async def list_account_transfers(account_id: str) -> TransferListResponse:
+    """按账户视角划转先后（全局落盘先后，划出与划入合并）查询与该账户相关的划转记录。
+
+    每条记录都是首次成功时**冻结的回执**（目标户逐凭证抵扣、划转时间与
+    双方当时头寸快照不变），并附该账户视角的 role（from/to）、序位 seq
+    （该账户相关划转中的第几笔）与对手方 other_account_id；冻结回执另含
+    两侧独立侧序号 from_transfer_count / to_transfer_count。账户级
+    total_transferred_out_yuan / total_transferred_in_yuan 为当前累计划出/
+    划入额，outstanding_yuan / credit_yuan 为按当前全部凭证、核销、退付与
+    划转**重算的最新值**（后续业务会改变它们，但不改写任何历史划转记录）。
+    从未入账也无划转的账户返回全 0/空。
+    """
+    result = list_transfers(account_id)
+    return TransferListResponse.model_validate(result)

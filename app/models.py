@@ -1245,3 +1245,169 @@ class PaymentReversalListResponse(BaseModel):
     reversals: List[PaymentReversalListItem] = Field(
         description="全部冲正记录，按冲正次序（reversal_seq 升序）；内容为首次冻结值"
     )
+
+
+# ---------------------------------------------------------------------------
+# 账户间信用划转：唯一划转单号 + 来源/目标账户 + 正金额，转入额 FIFO 抵欠费
+# ---------------------------------------------------------------------------
+
+MAX_TRANSFER_NO_LEN = 128
+MAX_TRANSFER_ACCOUNT_LEN = 128
+
+
+class CreditTransferRequest(BaseModel):
+    """把一笔来源账户已形成的信用划转到目标账户：全平台唯一划转单号 +
+    来源/目标账户 + 正金额。本接口为账户级全局接口（账户不在路径中）。"""
+
+    transfer_no: str = Field(
+        min_length=1,
+        max_length=MAX_TRANSFER_NO_LEN,
+        description="调用方划转单号（全平台唯一）：同号 + 同来源 + 同目标 + 同金额"
+        "重试返回首次回执；同号换账户或换金额返回 409 冲突",
+    )
+    from_account_id: str = Field(
+        min_length=1,
+        max_length=MAX_TRANSFER_ACCOUNT_LEN,
+        description="来源账户（划出信用方）：必须已有台账，且划转额不超过其当前信用",
+    )
+    to_account_id: str = Field(
+        min_length=1,
+        max_length=MAX_TRANSFER_ACCOUNT_LEN,
+        description="目标账户（划入抵欠费方）：必须已有台账，且不得与来源账户相同；"
+        "转入额按入账顺序抵扣未付清凭证，剩余形成信用，不算现金实收",
+    )
+    amount_yuan: float = Field(
+        gt=0.0,
+        description="划转金额（元，必须为正且有限）；超过来源当前信用整笔拒绝、"
+        "双方均不留流水",
+    )
+
+
+class TransferApplicationResponse(BaseModel):
+    """转入额对目标户一张未付清正额凭证的抵扣（允许部分付清），均为首次落盘冻结值。
+
+    转入额不是现金：它与应退池同口径抵减尚欠，故不产生现金核销、
+    不增加目标账户累计实收。
+    """
+
+    application_no: int = Field(description="本笔划转内对目标户的抵扣序号（从 1 起，按入账顺序）")
+    entry_no: int = Field(description="被抵扣明细在目标账户内的入账序号（原入账顺序）")
+    session_id: str = Field(description="被抵扣凭证所属执行会话")
+    voucher_no: int = Field(description="被抵扣凭证在该会话内的出单序号")
+    applied_yuan: float = Field(description="本次转入额抵扣到该凭证的金额（>0）")
+    outstanding_before_yuan: float = Field(
+        description="抵扣前该凭证在应退/转入池抵减后的尚欠"
+    )
+    outstanding_after_yuan: float = Field(
+        description="抵扣后该凭证的尚欠（0 即本凭证已付清）"
+    )
+
+
+class CreditTransferReceiptResponse(BaseModel):
+    """一笔信用划转的回执：首次 result=transferred，原样重试 result=deduped。
+
+    重试返回的始终是首次成功时冻结的内容（目标户逐凭证抵扣、划转时间与
+    双方当时尚欠/信用快照），即使后来两户头寸又被其他业务改变也不漂移。
+    """
+
+    transfer_no: str
+    from_account_id: str = Field(description="来源账户（划出信用方）")
+    to_account_id: str = Field(description="目标账户（划入抵欠费方）")
+    result: Literal["transferred", "deduped"] = Field(
+        description="transferred=本次新划转并原子落盘；deduped=同号同双方同金额重试，"
+        "原样返回首次回执"
+    )
+    amount_yuan: float = Field(description="本次划转金额（正）")
+    transferred_at: str = Field(description="首次划转时间（UTC ISO 8601，重试不漂移）")
+    applications: List[TransferApplicationResponse] = Field(
+        description="目标户逐凭证抵扣，按原入账顺序（entry_no 升序），只含实际抵扣到"
+        "未付清正额凭证的部分（可只部分付清）；转入额不算现金，没有现金分配"
+    )
+    from_outstanding_yuan: float = Field(
+        description="划转后来源最新尚欠（划转只扣信用，不改变来源逐凭证尚欠，≥0）"
+    )
+    from_credit_yuan: float = Field(
+        description="划转后来源账户信用（扣除本笔划出额后的剩余，≥0）"
+    )
+    from_transfer_count: int = Field(description="划转后来源账户累计划出笔数（含本笔）")
+    total_transferred_out_yuan: float = Field(
+        description="划转后来源累计划出信用总额（含本笔）；重试时为首次划转当时的快照"
+    )
+    to_outstanding_yuan: float = Field(
+        description="划转后目标最新尚欠（转入额按入账顺序抵扣后的全部未付清余额，≥0）"
+    )
+    to_credit_yuan: float = Field(
+        description="划转后目标账户信用（目标既有信用 + 抵扣后剩余转入额，≥0，与尚欠不同时为正）"
+    )
+    to_transfer_count: int = Field(description="划转后目标账户累计划入笔数（含本笔）")
+    total_transferred_in_yuan: float = Field(
+        description="划转后目标累计划入信用总额（含本笔）；重试时为首次划转当时的快照"
+    )
+
+
+class TransferListItem(BaseModel):
+    """账户划转记录列表中的一条：落盘时冻结的首次回执（列表中 result 恒为 transferred）。
+
+    在冻结回执之上附加该账户视角的 role / seq / other_account_id：
+    该账户是划出方时 role=from，是划入方时 role=to；seq 为该账户相关
+    划转（划出与划入合并、按全平台落盘先后）中的序位（从 1 起连续）。
+    两侧各自的侧序号仍保留在冻结回执的 from_transfer_count /
+    to_transfer_count 中（各自从 1 起、彼此独立连续）。
+    """
+
+    transfer_no: str
+    from_account_id: str
+    to_account_id: str
+    result: Literal["transferred"] = Field(
+        description="列表只反映落盘事实：每条都是首次成功的划转；"
+        "是否重试请在提交接口看 result=deduped"
+    )
+    amount_yuan: float
+    transferred_at: str
+    applications: List[TransferApplicationResponse] = Field(
+        description="该笔划转对目标户冻结的逐凭证抵扣（按原入账顺序）"
+    )
+    from_outstanding_yuan: float = Field(description="首次划转当时来源尚欠快照")
+    from_credit_yuan: float = Field(description="首次划转当时来源信用快照（扣本笔后）")
+    from_transfer_count: int = Field(description="本笔在来源账户划出侧的序号（1 起）")
+    total_transferred_out_yuan: float = Field(
+        description="首次划转当时来源累计划出额快照（后续划转不回改）"
+    )
+    to_outstanding_yuan: float = Field(description="首次划转当时目标尚欠快照（抵本笔后）")
+    to_credit_yuan: float = Field(description="首次划转当时目标信用快照（含剩余转入额）")
+    to_transfer_count: int = Field(description="本笔在目标账户划入侧的序号（1 起）")
+    total_transferred_in_yuan: float = Field(
+        description="首次划转当时目标累计划入额快照（后续划转不回改）"
+    )
+    role: Literal["from", "to"] = Field(
+        description="本账户在该笔划转中的角色：from=划出方，to=划入方"
+    )
+    seq: int = Field(
+        description="该账户视角（划出与划入合并、按全平台落盘先后）的划转序位（1 起）"
+    )
+    other_account_id: str = Field(description="划转对手方账户（本账户划出时为目标，划入时为来源）")
+
+
+class TransferListResponse(BaseModel):
+    """按账户查询与该账户相关的全部划转记录（划出与划入合并）与当前最新头寸。"""
+
+    account_id: str
+    transfer_count: int = Field(
+        description="与该账户相关的划转笔数（作为划出方与划入方的笔数之和）"
+    )
+    total_transferred_out_yuan: float = Field(
+        description="当前账户累计划出信用（全部划出额之和，随新增划出增长）"
+    )
+    total_transferred_in_yuan: float = Field(
+        description="当前账户累计划入信用（全部划入额之和，随新增划入增长）"
+    )
+    outstanding_yuan: float = Field(
+        description="当前最新尚欠（随后续入账、收款、退付与划转变化；旧划转回执不改写）"
+    )
+    credit_yuan: float = Field(
+        description="当前账户信用（已扣退付/划出、已加划入并抵减未付凭证后的剩余，允许为正）"
+    )
+    transfers: List[TransferListItem] = Field(
+        description="全部划转记录，按该账户视角划转先后（全局落盘先后，划出与划入合并）；"
+        "内容为首次冻结值，附 role / seq / other_account_id"
+    )

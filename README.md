@@ -1,6 +1,6 @@
 # 家庭储能时段调度 API
 
-基于 **Python + FastAPI + Pydantic** 的家庭储能调度服务。输入等长的半小时电价、基础负荷、光伏预测序列以及电池参数，用**动态规划（SOC 离散到 0.1 kWh）**求出满足功率、SOC 和末端 SOC 约束的**最低总成本**充放电计划；另提供 `/telemetry/audit` 对半小时实测记录做能量守恒与购电量**审计**（只核对标记，不修正读数、不生成调度计划）；`/dispatch/settlement` 对一份已下发计划做**执行结算**：携带原始 `/dispatch` 输入与计划快照，服务重算校验快照未被篡改、复用遥测审计逐条核对，并只对首个异常 / SOC 断点之前的连续有效区间按实测购电量与吞吐量计费；`/dispatch/replan` 支持计划**执行到中途**时依据连续实测前缀**续排**：核对原计划与前缀审计、保留实测原记录并从实测末态重排余段，同时返回可直接交给结算接口的余段调度输入与计划快照。`/dispatch/sessions` 进一步提供**可持久接续的执行会话**：实测记录可分多批到达，创建会话时提交原 `/dispatch` 输入、完整计划快照与审计容差（先重算确认快照一致），之后按时段下标成批追加记录，首批首态接原初始 SOC、后续批次首态接已保存末态，沿用现有遥测审计逐段核对且**整批原子入库**；批次边界与首次回执随记录同事务落库，**起点、长度、内容都与某已确认整批一致**的重试幂等返回该批首收回执（不随后续批次漂移），短批、内容变更或跨批拼接等重叠上报一律 409、只有一份生效；会话与记录落在 **SQLite（命名卷）**，进程重启后仍可查询、续报，未完成前缀可直接续排、满期记录可直接结算。满期（`complete`）会话还支持**计量表更正**：按会话经 HTTP 提交期望修订号与若干「时段下标 + 完整替换记录」，服务端在当前版本上叠加（未指定时段保持原值）并用会话容量、效率、初始 SOC 与审计容差**重新核对整段台账**，下标重复/越界、任一时段能量失衡或相邻 SOC 断点都整次拒绝、已有修订不变；核对通过后原子落盘修订号与修订台账（修订号从 0 起单调递增，过期返回 409 与当前号）。**最初上报记录、原会话查询、批次重试判定与首收回执永不被更正改写**；更正查询返回原始与当前修订记录、差异下标、历次更正，以及可直接提交现有结算接口的完整请求数据；重启后修订仍可查询并继续更正。满期会话还可经 `POST /dispatch/sessions/{id}/vouchers` 按修订号**出具逐版结算凭证**：修订号 0 对最初上报记录、其余版本对对应更正台账，沿用现有结算规则在同一写事务内核算落盘（**只能结算有效前缀时整次拒绝且不留下凭证**）；凭证保存修订号、结算摘要、实测总费用、出单时间并冻结该版台账与完整结算报告，**首张记全额、以后每张列出相对上一张的应补或应退差额（允许跳过未出单的中间修订）**，同一修订号重试始终返回原凭证（即使后来发生更正），未出单的过期修订号返回 409 及当前号；`GET .../vouchers` 按出单次序查询凭证并返回当前修订待出单状态，凭证持久化在命名卷 SQLite 中，重启后仍可查，出单与并发更正互斥使凭证不会引用过期台账。`/accounts/{账户ID}/payments` 进一步在应收台账上**登记收款**：按账户提交**全平台唯一收款单号 + 正金额**，服务端先用账户内**已记应退凭证**按原入账顺序抵减尚未付清的正额凭证（剩余应退形成账户**信用**），再把收款按原入账顺序 **FIFO 逐凭证核销**（可部分付清），**超过当前应付的收款整笔拒绝且不留任何流水**；返回本次**逐凭证分配、累计实收与最新尚欠/信用**，并提供收款记录查询；**同一单号同账户同金额重试返回首次冻结回执**（即使后来又入账新的应补/应退凭证），单号换金额或跨账户使用一律 **409 冲突**；**后续补退不改写旧收款分配**，最新尚欠随凭证变化、允许显示信用；核对与落盘和原入账共用同一 SQLite 写事务，并发与重启后都不会重复核销。`/accounts/{账户ID}/payment-reversals` 把**误记的到账收款整笔冲正**：按账户提交**原收款单号**办理（**只接受原收款所属账户**；原单不存在或账户不符明确拒绝、不留冲正记录），**原收款、逐凭证分配与首次收款回执保留**，冲正后该笔**不再计入有效实收**；台账明细的逐凭证已收、账户累计实收以及台账、收款、退付查询的当前尚欠与信用，按**有效收款、已记应退与已付退付**重算，已发生的后续收款分配与退付保持原样、不回填历史分配；后续新收款按重算后尚欠分配，原单号重试收款仍返回原收款回执；**重复冲正返回首次冲正回执**；冲正返回金额、时间与冲正后头寸，核对与落盘和入账、收款、退付共用同一 SQLite 写事务，并发只能生效一次、失败不留冲正记录；收款查询展示冲正状态，冲正记录持久化、重启后可查。`/accounts/{账户ID}/payouts` 把账户里由应退凭证抵减未付凭证后剩余的信用**实际退付**：按账户提交**全平台唯一退付单号 + 正金额**，**只能支付当前信用，信用不足整笔拒绝、不留记录**；退付后台账与收款查询的当前信用同步扣除已付退款，后续入账的应补/应退仍按原规则改变最新尚欠与信用，已记凭证、收款分配与首次回执保持原样；返回**退付金额、退付时间与退付后头寸**，并提供按退付次序查询记录的接口；**同单号同账户同金额重试返回首次回执**，换账户或金额一律 **409 冲突**；信用核对与退付登记和原入账、收款共用同一 SQLite 写事务，并发请求不会重复支付，重启后记录仍可查。
+基于 **Python + FastAPI + Pydantic** 的家庭储能调度服务。输入等长的半小时电价、基础负荷、光伏预测序列以及电池参数，用**动态规划（SOC 离散到 0.1 kWh）**求出满足功率、SOC 和末端 SOC 约束的**最低总成本**充放电计划；另提供 `/telemetry/audit` 对半小时实测记录做能量守恒与购电量**审计**（只核对标记，不修正读数、不生成调度计划）；`/dispatch/settlement` 对一份已下发计划做**执行结算**：携带原始 `/dispatch` 输入与计划快照，服务重算校验快照未被篡改、复用遥测审计逐条核对，并只对首个异常 / SOC 断点之前的连续有效区间按实测购电量与吞吐量计费；`/dispatch/replan` 支持计划**执行到中途**时依据连续实测前缀**续排**：核对原计划与前缀审计、保留实测原记录并从实测末态重排余段，同时返回可直接交给结算接口的余段调度输入与计划快照。`/dispatch/sessions` 进一步提供**可持久接续的执行会话**：实测记录可分多批到达，创建会话时提交原 `/dispatch` 输入、完整计划快照与审计容差（先重算确认快照一致），之后按时段下标成批追加记录，首批首态接原初始 SOC、后续批次首态接已保存末态，沿用现有遥测审计逐段核对且**整批原子入库**；批次边界与首次回执随记录同事务落库，**起点、长度、内容都与某已确认整批一致**的重试幂等返回该批首收回执（不随后续批次漂移），短批、内容变更或跨批拼接等重叠上报一律 409、只有一份生效；会话与记录落在 **SQLite（命名卷）**，进程重启后仍可查询、续报，未完成前缀可直接续排、满期记录可直接结算。满期（`complete`）会话还支持**计量表更正**：按会话经 HTTP 提交期望修订号与若干「时段下标 + 完整替换记录」，服务端在当前版本上叠加（未指定时段保持原值）并用会话容量、效率、初始 SOC 与审计容差**重新核对整段台账**，下标重复/越界、任一时段能量失衡或相邻 SOC 断点都整次拒绝、已有修订不变；核对通过后原子落盘修订号与修订台账（修订号从 0 起单调递增，过期返回 409 与当前号）。**最初上报记录、原会话查询、批次重试判定与首收回执永不被更正改写**；更正查询返回原始与当前修订记录、差异下标、历次更正，以及可直接提交现有结算接口的完整请求数据；重启后修订仍可查询并继续更正。满期会话还可经 `POST /dispatch/sessions/{id}/vouchers` 按修订号**出具逐版结算凭证**：修订号 0 对最初上报记录、其余版本对对应更正台账，沿用现有结算规则在同一写事务内核算落盘（**只能结算有效前缀时整次拒绝且不留下凭证**）；凭证保存修订号、结算摘要、实测总费用、出单时间并冻结该版台账与完整结算报告，**首张记全额、以后每张列出相对上一张的应补或应退差额（允许跳过未出单的中间修订）**，同一修订号重试始终返回原凭证（即使后来发生更正），未出单的过期修订号返回 409 及当前号；`GET .../vouchers` 按出单次序查询凭证并返回当前修订待出单状态，凭证持久化在命名卷 SQLite 中，重启后仍可查，出单与并发更正互斥使凭证不会引用过期台账。`/accounts/{账户ID}/payments` 进一步在应收台账上**登记收款**：按账户提交**全平台唯一收款单号 + 正金额**，服务端先用账户内**已记应退凭证**按原入账顺序抵减尚未付清的正额凭证（剩余应退形成账户**信用**），再把收款按原入账顺序 **FIFO 逐凭证核销**（可部分付清），**超过当前应付的收款整笔拒绝且不留任何流水**；返回本次**逐凭证分配、累计实收与最新尚欠/信用**，并提供收款记录查询；**同一单号同账户同金额重试返回首次冻结回执**（即使后来又入账新的应补/应退凭证），单号换金额或跨账户使用一律 **409 冲突**；**后续补退不改写旧收款分配**，最新尚欠随凭证变化、允许显示信用；核对与落盘和原入账共用同一 SQLite 写事务，并发与重启后都不会重复核销。`/accounts/{账户ID}/payment-reversals` 把**误记的到账收款整笔冲正**：按账户提交**原收款单号**办理（**只接受原收款所属账户**；原单不存在或账户不符明确拒绝、不留冲正记录），**原收款、逐凭证分配与首次收款回执保留**，冲正后该笔**不再计入有效实收**；台账明细的逐凭证已收、账户累计实收以及台账、收款、退付查询的当前尚欠与信用，按**有效收款、已记应退与已付退付**重算，已发生的后续收款分配与退付保持原样、不回填历史分配；后续新收款按重算后尚欠分配，原单号重试收款仍返回原收款回执；**重复冲正返回首次冲正回执**；冲正返回金额、时间与冲正后头寸，核对与落盘和入账、收款、退付共用同一 SQLite 写事务，并发只能生效一次、失败不留冲正记录；收款查询展示冲正状态，冲正记录持久化、重启后可查。`/accounts/{账户ID}/payouts` 把账户里由应退凭证抵减未付凭证后剩余的信用**实际退付**：按账户提交**全平台唯一退付单号 + 正金额**，**只能支付当前信用，信用不足整笔拒绝、不留记录**；退付后台账与收款查询的当前信用同步扣除已付退款，后续入账的应补/应退仍按原规则改变最新尚欠与信用，已记凭证、收款分配与首次回执保持原样；返回**退付金额、退付时间与退付后头寸**，并提供按退付次序查询记录的接口；**同单号同账户同金额重试返回首次回执**，换账户或金额一律 **409 冲突**；信用核对与退付登记和原入账、收款共用同一 SQLite 写事务，并发请求不会重复支付，重启后记录仍可查。`POST /account-transfers` 办理**账户间已形成信用的划转**：提交全平台唯一划转单号、来源账户、目标账户与正金额（两户须不同且都已有台账，金额不得超过来源当前信用，否则整笔拒绝、双方均不留流水）；成功后来源信用扣减，目标按原入账顺序用转入额抵扣尚未付清的正额凭证（可部分付清）、剩余转入额形成目标信用；**转入额不算现金实收**（累计实收不变、不写现金核销），已记凭证、旧收款分配、退付与首次回执均不改写；台账、收款、退付查询及后续收款/退付按划转后的两户头寸处理（划出先扣信用池、划入加回再抵减）；返回划转金额、时间、目标户逐凭证抵扣与双方划转后最新尚欠/信用，并可经 `GET /accounts/{账户ID}/transfers` 按账户查询划出与划入记录；**同单号同双方同金额重试返回首次冻结回执**，换账户或金额一律 **409 冲突**；双方信用核对与划转落盘共用同一 SQLite 写事务，并发划转和退付不得重复支用信用，重启后记录仍可查。
 
 ## 一条命令启动
 
@@ -1350,9 +1350,185 @@ curl -s $BASE/accounts/$ACCT/payment-reversals | jq \
 
 并发与重启：对同一笔收款并发提交多笔冲正，数据库主键保证**只有一笔生效（reversed）**，其余返回 `deduped` 的首次冲正回执，冲正记录只多一条、有效实收只减一次；冲正与新收款/退付并发时写事务串行核对，不会重复核销也不留半吊子状态；`docker compose restart`（命名卷保留）后冲正记录与收款冲正状态仍在，重复冲正仍返回首次回执，且可继续冲正其他收款（冲正序号接续）。
 
+### `POST /account-transfers` — 账户间信用划转
+
+一个账户里**已形成的信用**可以划转给另一个账户抵扣欠费。这是**账户级全局接口**（账户不在路径中），请求体给出全平台唯一划转单号、来源账户、目标账户与正金额：
+
+```json
+{"transfer_no": "TR-2026-0001", "from_account_id": "family-a", "to_account_id": "family-b", "amount_yuan": 0.005}
+```
+
+划转口径（金额一律取已入账凭证**冻结的计费栏**与已落盘收款 / 退付 / 划转流水，服务端不重新核算）：
+
+- **账户与额度校验**：来源与目标必须是**两个不同**的账户，且**都已有台账**（至少一张已入账凭证）；划转额不得超过来源账户**当前信用** `credit_yuan`（口径与退付相同：已记应退 − 已退付 − 已划出 + 已划入后按入账顺序抵减未付凭证的剩余）。两户相同 → **422 `transfer_same_account`**；任一账户无台账 → **422 `transfer_account_no_ledger`**（错误体附 `account_id` / `side`）；划转额超过来源当前信用 → **422 `transfer_exceeds_credit`**（错误体附来源当前 `from_credit_yuan` / `from_outstanding_yuan`）。以上拒绝均**整笔失败、双方都不留任何划转流水**；金额必须为正（0 / 负数 → 422 `invalid_input`）。
+- **来源信用扣减**：划转成功后来源账户 `credit_yuan` 立即扣减划转额；划转只动信用池，**不改变来源任何凭证的尚欠与已收款**（落盘时刻已核验「划转额 ≤ 当时信用」，扣后池仍能全额覆盖既有抵减），也不动来源累计实收。
+- **目标按入账顺序抵欠费、剩余形成信用**：转入额按目标账户**原入账顺序**（`entry_no` 升序）抵扣**尚未付清的正额凭证**（`full` / `supplement`），**可只部分付清一张**（回执 `applications[]` 给出每张凭证抵扣前后尚欠）；抵扣后没用完的转入额**叠加在目标既有信用之上**形成新的 `credit_yuan`。
+- **转入额不算现金实收**：转入额与应退池同口径抵减，只增加目标逐凭证的 `refund_applied_yuan`，**不写现金核销**：目标 `total_received_yuan` 与逐凭证 `paid_yuan` 不变；**已记凭证、旧收款分配、退付与各首次回执一律不改写**。
+- **划转后所有查询与后续业务按新头寸**：台账（`GET .../ledger`）、收款（`GET .../payments`）、退付（`GET .../payouts`）查询的两户尚欠 / 信用按「已记应退 − 已退付 **− 已划出 + 已划入**」的信用池重算；后续收款按划转后尚欠 FIFO（转入抵掉的部分不再收现金，超过尚欠仍整笔拒绝），后续退付可支付剩余转入额形成的信用，后续入账应补 / 应退与收款冲正也都按划转后的池子重新抵减。
+- **幂等**：同一 `transfer_no` + 同来源 + 同目标 + 同金额重试 → `result=deduped`，返回**首次成功时冻结的回执**（目标户逐凭证抵扣、划转时间与双方当时尚欠/信用快照都不漂移），即使后来两户头寸又被划转 / 退付 / 入账改变。
+- **单号冲突**：同一 `transfer_no` **换了金额、或换了来源 / 目标账户** → **409 `transfer_no_conflict`**，错误体附已登记的 `from_account_id` / `to_account_id` / `amount_yuan`，本次不写入。
+- **同一写事务**：「双方头寸重算 → 来源信用核对 → 目标逐凭证抵扣 → 划转落盘」与原入账、收款、退付共用同一把 SQLite 写事务锁（RLock + `BEGIN IMMEDIATE`），`transfer_no` 主键与两侧 `(账户, 侧序号)` 唯一键在数据库层兜底：**并发划转与退付不得重复支用同一笔信用**（写事务内串行重算），并发同单号只有一笔落盘；进程重启后记录仍在、重试仍返回首次回执。
+
+回执字段：`applications[]` 为目标户逐凭证抵扣（`entry_no` / `session_id` / `voucher_no` / `applied_yuan` 与抵扣前后尚欠），`from_outstanding_yuan` / `from_credit_yuan` / `from_transfer_count` / `total_transferred_out_yuan` 为来源划转后头寸，`to_outstanding_yuan` / `to_credit_yuan` / `to_transfer_count` / `total_transferred_in_yuan` 为目标划转后头寸，`transferred_at` 为划转时间（UTC）。
+
+### `GET /accounts/{account_id}/transfers` — 按账户查询划转记录
+
+返回与该账户相关的全部划转记录（**划出与划入合并**，按全平台划转落盘先后排列）：每条都是首次成功时**冻结的回执**（列表中 `result` 恒为 `transferred`，目标户逐凭证抵扣与双方当时头寸快照不变），并附该账户视角的 `role`（`from` 划出 / `to` 划入）、该账户相关划转中的序位 `seq`（从 1 起连续）与对手方 `other_account_id`；冻结回执里的 `from_transfer_count` / `to_transfer_count` 是两侧**各自独立连续**的侧序号。账户级 `total_transferred_out_yuan` / `total_transferred_in_yuan` 为当前累计划出 / 划入额，`outstanding_yuan` / `credit_yuan` 为重算的最新值。从未入账也无划转的账户返回全 0 与空列表。
+
+### 可执行示例（信用划转、抵扣欠费、幂等与冲突、查询）
+
+下面的例子从零建两户台账：`family-a` 持有 0.01 元信用（先出一张 0.10 全额凭证并收款付清，再更正出一张 0.01 应退凭证入账），`family-b` 有一张 0.10 元未付清凭证。需要 `jq`，先 `docker compose up -d --build`。
+
+```bash
+BASE=http://localhost:8000
+A=family-a
+B=family-b
+
+# 0a) 造来源户 family-a 的信用 0.01：创建满期会话 S1 → 出全额凭证 0.10 → 入账 → 收款付清
+cat > /tmp/tr-dispatch.json <<'JSON'
+{"prices":[0.0,1.0,1.0,0.0],"base_load_kw":[0.2,0.2,0.2,0.2],"pv_kw":[0.0,0.0,0.0,0.0],
+ "capacity_kwh":0.4,"max_charge_kw":1.0,"max_discharge_kw":1.0,
+ "charge_efficiency":0.9,"discharge_efficiency":0.9,
+ "initial_soc_kwh":0.0,"min_terminal_soc_kwh":0.0,"degradation_cost_per_kwh":0.2}
+JSON
+PLAN=$(curl -s -X POST $BASE/dispatch -H 'Content-Type: application/json' -d @/tmp/tr-dispatch.json)
+cat > /tmp/tr-records.json <<'JSON'
+{"start_index":0,"records":[
+ {"base_load_kw":0.2,"pv_kw":0.0,"charge_ac_energy_kwh":0.222222,"discharge_ac_energy_kwh":0.0,
+  "grid_purchase_energy_kwh":0.322222,"soc_start_kwh":0.0,"soc_end_kwh":0.2},
+ {"base_load_kw":0.2,"pv_kw":0.0,"charge_ac_energy_kwh":0.0,"discharge_ac_energy_kwh":0.09,
+  "grid_purchase_energy_kwh":0.01,"soc_start_kwh":0.2,"soc_end_kwh":0.1},
+ {"base_load_kw":0.2,"pv_kw":0.0,"charge_ac_energy_kwh":0.0,"discharge_ac_energy_kwh":0.09,
+  "grid_purchase_energy_kwh":0.01,"soc_start_kwh":0.1,"soc_end_kwh":0.0},
+ {"base_load_kw":0.2,"pv_kw":0.0,"charge_ac_energy_kwh":0.0,"discharge_ac_energy_kwh":0.0,
+  "grid_purchase_energy_kwh":0.1,"soc_start_kwh":0.0,"soc_end_kwh":0.0}]}
+JSON
+S1=$(jq -n --argjson d "$(cat /tmp/tr-dispatch.json)" --argjson p "$PLAN" \
+        '{dispatch:$d, plan_snapshot:$p, audit_tolerance_kwh:0.01}' \
+  | curl -s -X POST $BASE/dispatch/sessions -H 'Content-Type: application/json' -d @- | jq -r .session_id)
+curl -s -X POST $BASE/dispatch/sessions/$S1/batches -H 'Content-Type: application/json' \
+  -d @/tmp/tr-records.json > /dev/null
+curl -s -X POST $BASE/dispatch/sessions/$S1/vouchers -H 'Content-Type: application/json' \
+  -d '{"expected_revision":0}' > /dev/null
+jq -n --arg s "$S1" '{items:[{session_id:$s, voucher_no:1}]}' \
+  | curl -s -X POST $BASE/accounts/$A/ledger -H 'Content-Type: application/json' -d @- > /dev/null
+jq -n '{payment_no:"TR-PAY-A1", amount_yuan:0.10}' \
+  | curl -s -X POST $BASE/accounts/$A/payments -H 'Content-Type: application/json' -d @- > /dev/null
+# 更正 t1（负荷 0.2→0.18、购电 0.01→0）：总费用 0.10 → 0.09，出应退 0.01 并入账 → 信用 0.01
+jq -n '{expected_revision:0, changes:[{index:1, record:
+  {"base_load_kw":0.18,"pv_kw":0.0,"charge_ac_energy_kwh":0.0,"discharge_ac_energy_kwh":0.09,
+   "grid_purchase_energy_kwh":0.0,"soc_start_kwh":0.2,"soc_end_kwh":0.1}}]}' \
+  | curl -s -X POST $BASE/dispatch/sessions/$S1/revisions -H 'Content-Type: application/json' -d @- > /dev/null
+curl -s -X POST $BASE/dispatch/sessions/$S1/vouchers -H 'Content-Type: application/json' \
+  -d '{"expected_revision":1}' > /dev/null
+jq -n --arg s "$S1" '{items:[{session_id:$s, voucher_no:2}]}' \
+  | curl -s -X POST $BASE/accounts/$A/ledger -H 'Content-Type: application/json' -d @- > /dev/null
+curl -s $BASE/accounts/$A/ledger | jq '{outstanding_yuan, credit_yuan}'
+# => {"outstanding_yuan":0.0,"credit_yuan":0.01}
+
+# 0b) 造目标户 family-b 的欠费 0.10：另一个满期会话 S2，全额凭证 0.10 入账但不付款
+S2=$(jq -n --argjson d "$(cat /tmp/tr-dispatch.json)" --argjson p "$PLAN" \
+        '{dispatch:$d, plan_snapshot:$p, audit_tolerance_kwh:0.01}' \
+  | curl -s -X POST $BASE/dispatch/sessions -H 'Content-Type: application/json' -d @- | jq -r .session_id)
+curl -s -X POST $BASE/dispatch/sessions/$S2/batches -H 'Content-Type: application/json' \
+  -d @/tmp/tr-records.json > /dev/null
+curl -s -X POST $BASE/dispatch/sessions/$S2/vouchers -H 'Content-Type: application/json' \
+  -d '{"expected_revision":0}' > /dev/null
+jq -n --arg s "$S2" '{items:[{session_id:$s, voucher_no:1}]}' \
+  | curl -s -X POST $BASE/accounts/$B/ledger -H 'Content-Type: application/json' -d @- > /dev/null
+curl -s $BASE/accounts/$B/ledger | jq '{outstanding_yuan, credit_yuan}'
+# => {"outstanding_yuan":0.10,"credit_yuan":0.0}
+
+# 1) 划转 0.005：来源信用 0.01 → 0.005；目标按入账顺序抵扣，尚欠 0.10 → 0.095
+jq -n '{transfer_no:"TR-2026-0001", from_account_id:$ENV.A, to_account_id:$ENV.B, amount_yuan:0.005}' \
+  | curl -s -X POST $BASE/account-transfers -H 'Content-Type: application/json' -d @- \
+  | tee /tmp/tr1.json | jq '{result, transfer_no, amount_yuan,
+        from_credit_yuan, from_outstanding_yuan,
+        to_credit_yuan, to_outstanding_yuan,
+        applications:[.applications[] | {entry_no, applied_yuan,
+                       outstanding_before_yuan, outstanding_after_yuan}]}'
+# => {"result":"transferred","transfer_no":"TR-2026-0001","amount_yuan":0.005,
+#     "from_credit_yuan":0.005,"from_outstanding_yuan":0.0,
+#     "to_credit_yuan":0.0,"to_outstanding_yuan":0.095,
+#     "applications":[{"entry_no":1,"applied_yuan":0.005,
+#                      "outstanding_before_yuan":0.10,"outstanding_after_yuan":0.095}]}
+
+# 2) 转入额不是现金：目标累计实收仍为 0、逐凭证 paid_yuan 仍为 0（抵减记在 refund_applied_yuan）
+curl -s $BASE/accounts/$B/ledger | jq \
+  '{total_received_yuan, outstanding_yuan, credit_yuan,
+    entries:[.entries[] | {paid_yuan, refund_applied_yuan, outstanding_yuan}]}'
+# => {"total_received_yuan":0.0,"outstanding_yuan":0.095,"credit_yuan":0.0,
+#     "entries":[{"paid_yuan":0.0,"refund_applied_yuan":0.005,"outstanding_yuan":0.095}]}
+
+# 3) 同单号同双方同金额重试 → result=deduped，逐字返回首次回执（双方头寸不漂移）
+jq -n '{transfer_no:"TR-2026-0001", from_account_id:$ENV.A, to_account_id:$ENV.B, amount_yuan:0.005}' \
+  | curl -s -X POST $BASE/account-transfers -H 'Content-Type: application/json' -d @- \
+  | jq '{result, transferred_at, from_credit_yuan, to_outstanding_yuan, from_transfer_count}'
+# => {"result":"deduped","transferred_at":"<同首次>","from_credit_yuan":0.005,
+#     "to_outstanding_yuan":0.095,"from_transfer_count":1}
+
+# 4) 同单号换金额 / 换账户 → 409 transfer_no_conflict（附已登记双方/金额），不写入
+jq -n '{transfer_no:"TR-2026-0001", from_account_id:$ENV.A, to_account_id:$ENV.B, amount_yuan:0.006}' \
+  | curl -s -w '\nHTTP %{http_code}\n' -X POST $BASE/account-transfers \
+      -H 'Content-Type: application/json' -d @-
+# => {"error":"transfer_no_conflict","from_account_id":"family-a","to_account_id":"family-b",
+#     "amount_yuan":0.005,...}  HTTP 409
+jq -n '{transfer_no:"TR-2026-0001", from_account_id:$ENV.B, to_account_id:$ENV.A, amount_yuan:0.005}' \
+  | curl -s -o /dev/null -w '%{http_code}\n' -X POST $BASE/account-transfers \
+      -H 'Content-Type: application/json' -d @-   # 409
+
+# 5) 超额划转整笔拒绝：来源只剩 0.005，划 0.006 → 422，附来源当前信用/尚欠，双方不留流水
+jq -n '{transfer_no:"TR-2026-0002", from_account_id:$ENV.A, to_account_id:$ENV.B, amount_yuan:0.006}' \
+  | curl -s -w '\nHTTP %{http_code}\n' -X POST $BASE/account-transfers \
+      -H 'Content-Type: application/json' -d @-
+# => {"error":"transfer_exceeds_credit","from_credit_yuan":0.005,"from_outstanding_yuan":0.0,...}  HTTP 422
+curl -s $BASE/accounts/$A/transfers | jq '.transfer_count'   # => 1（拒绝未留流水）
+
+# 6) 两户相同 / 账户无台账 → 422（transfer_same_account / transfer_account_no_ledger）
+jq -n '{transfer_no:"TR-SELF", from_account_id:$ENV.A, to_account_id:$ENV.A, amount_yuan:0.001}' \
+  | curl -s -w '\nHTTP %{http_code}\n' -X POST $BASE/account-transfers \
+      -H 'Content-Type: application/json' -d @-                 # 422 transfer_same_account
+jq -n '{transfer_no:"TR-NL", from_account_id:$ENV.A, to_account_id:"no-ledger", amount_yuan:0.001}' \
+  | curl -s -w '\nHTTP %{http_code}\n' -X POST $BASE/account-transfers \
+      -H 'Content-Type: application/json' -d @-                 # 422 transfer_account_no_ledger
+
+# 7) 把来源剩余信用 0.005 全部划走：来源信用归零；目标尚欠 0.095 → 0.09，没有剩余信用
+jq -n '{transfer_no:"TR-2026-0003", from_account_id:$ENV.A, to_account_id:$ENV.B, amount_yuan:0.005}' \
+  | curl -s -X POST $BASE/account-transfers -H 'Content-Type: application/json' -d @- \
+  | jq '{result, from_credit_yuan, to_credit_yuan, to_outstanding_yuan,
+         from_transfer_count, to_transfer_count}'
+# => {"result":"transferred","from_credit_yuan":0.0,"to_credit_yuan":0.0,
+#     "to_outstanding_yuan":0.09,"from_transfer_count":2,"to_transfer_count":2}
+
+# 8) 划转后收款按新尚欠处理：0.09 可收，再多收 0.01 整笔拒绝（转入抵掉的部分不收现金）
+jq -n '{payment_no:"TR-PAY-B1", amount_yuan:0.09}' \
+  | curl -s -X POST $BASE/accounts/$B/payments -H 'Content-Type: application/json' -d @- \
+  | jq '{total_received_yuan, outstanding_yuan, allocations:[.allocations[]|.allocated_yuan]}'
+# => {"total_received_yuan":0.09,"outstanding_yuan":0.0,"allocations":[0.09]}
+jq -n '{payment_no:"TR-PAY-B2", amount_yuan:0.01}' \
+  | curl -s -o /dev/null -w '%{http_code}\n' -X POST $BASE/accounts/$B/payments \
+      -H 'Content-Type: application/json' -d @-   # 422 payment_exceeds_outstanding
+
+# 9) 按账户查询划转记录：来源侧两笔划出、目标侧两笔划入（seq 为该账户视角序位，
+#    role 标注角色、other_account_id 为对手方；内容为首次冻结值，账户级头寸为最新值）
+curl -s $BASE/accounts/$A/transfers | jq \
+  '{transfer_count, total_transferred_out_yuan, outstanding_yuan, credit_yuan,
+    transfers:[.transfers[]|{transfer_no, role, seq, other_account_id, amount_yuan}]}'
+curl -s $BASE/accounts/$B/transfers | jq \
+  '{transfer_count, total_transferred_in_yuan, outstanding_yuan, credit_yuan,
+    transfers:[.transfers[]|{transfer_no, role, seq, other_account_id, amount_yuan}]}'
+
+# 10) 从未入账的账户：划转查询全 0；作为来源或目标提交划转 → 422
+curl -s $BASE/accounts/never-used/transfers
+# => {"account_id":"never-used","transfer_count":0,"total_transferred_out_yuan":0.0,
+#     "total_transferred_in_yuan":0.0,"outstanding_yuan":0.0,"credit_yuan":0.0,"transfers":[]}
+```
+
+并发与重启：对同一 `transfer_no` 并发提交多笔，数据库主键保证**只有一笔 200（transferred）**，其余同双方同金额返回 `deduped`、换账户 / 换金额返回 409，双方头寸只变动一次；多笔不同单号划转与退付并发打到同一账户时，写事务串行重算信用池，**不会重复支用同一笔信用**（累计划出 + 累计退付恰为已形成的信用）；`docker compose restart`（命名卷保留）后划转记录仍在，同单号重试仍返回首次回执，且可继续划转（两侧侧序号接续）。
+
 ### 持久化
 
-会话、逐段记录、批次边界、首次回执、计量表修订、逐版结算凭证、家庭应收台账明细、账户收款记录、收款冲正记录与信用退付记录存放在容器内 `/data/sessions.db`（SQLite，环境变量 `DISPATCH_SESSION_DB` 可覆盖路径），Compose 已把命名卷 `dispatch-session-data` 挂到 `/data`：容器重建、镜像升级或进程重启后，会话、已确认记录、历次修订、已出凭证、账户台账明细/余额、**收款主行与逐凭证核销、冲正主行、退付主行**原样保留，可继续查询、幂等重试、续报、在当前修订号上继续更正、按出单次序取回冻结凭证、按入账次序查询各账户明细与净应收，并可**继续登记收款 / 冲正 / 退付（序号接续）、按单号取回首次回执**。裸机运行时若 `/data` 不可写，自动落到工作目录 `./data/sessions.db`。旧版本库（只有逐段记录、无批次边界 / 修订 / 凭证 / 台账 / 收款 / 退付 / 冲正表）打开时自动补建新表：查询与从 `next_index` 续报不受影响，历史区间因无法确认批次边界，重叠上报按 409 处理而不猜测去重；修订表为空时修订查询返回修订号 0（台账即最初上报记录）；凭证表为空时凭证查询返回空列表与当前修订待出单状态；台账表为空时账户查询返回空明细、余额与尚欠/信用均为 0；收款表为空时收款查询返回空列表与全 0 头寸；退付表为空时退付查询返回空列表与全 0 头寸；冲正表为空时冲正查询返回空列表与全 0 头寸、收款记录均显示未冲正。
+会话、逐段记录、批次边界、首次回执、计量表修订、逐版结算凭证、家庭应收台账明细、账户收款记录、收款冲正记录、信用退付记录与账户间信用划转记录存放在容器内 `/data/sessions.db`（SQLite，环境变量 `DISPATCH_SESSION_DB` 可覆盖路径），Compose 已把命名卷 `dispatch-session-data` 挂到 `/data`：容器重建、镜像升级或进程重启后，会话、已确认记录、历次修订、已出凭证、账户台账明细/余额、**收款主行与逐凭证核销、冲正主行、退付主行、划转主行（含目标户逐凭证抵扣与双方头寸快照）**原样保留，可继续查询、幂等重试、续报、在当前修订号上继续更正、按出单次序取回冻结凭证、按入账次序查询各账户明细与净应收，并可**继续登记收款 / 冲正 / 退付 / 划转（序号接续）、按单号取回首次回执**。裸机运行时若 `/data` 不可写，自动落到工作目录 `./data/sessions.db`。旧版本库（只有逐段记录、无批次边界 / 修订 / 凭证 / 台账 / 收款 / 退付 / 冲正 / 划转表）打开时自动补建新表：查询与从 `next_index` 续报不受影响，历史区间因无法确认批次边界，重叠上报按 409 处理而不猜测去重；修订表为空时修订查询返回修订号 0（台账即最初上报记录）；凭证表为空时凭证查询返回空列表与当前修订待出单状态；台账表为空时账户查询返回空明细、余额与尚欠/信用均为 0；收款表为空时收款查询返回空列表与全 0 头寸；退付表为空时退付查询返回空列表与全 0 头寸；冲正表为空时冲正查询返回空列表与全 0 头寸、收款记录均显示未冲正；划转表为空时划转查询返回空列表与全 0 头寸。
 
 ### 可执行示例（创建、分批追加、重试、查询、续排/结算）
 
@@ -1575,7 +1751,7 @@ jq -c '{dispatch, plan_snapshot, audit_tolerance_kwh,
 - `payment_no_conflict`（409）：同一收款单号已登记但**金额不同或账户不同**，错误体附首次登记的 `account_id` / `amount_yuan`，本次不写入；同号同账户同金额不报错，返回 `result=deduped` 的首次冻结回执；
 - `invalid_input`：金额非正（必须 > 0）、收款单号为空 / 超长等请求体非法。
 
-账户信用退付接口（`POST /accounts/{id}/payouts`；`payout_no_conflict` 为 **HTTP 409**，其余为 422）：
+信用退付接口（`POST /accounts/{id}/payouts`；`payout_no_conflict` 为 **HTTP 409**，其余为 422）：
 
 - `payout_exceeds_credit`：退付金额超过当前信用（账户没有信用时任何正金额也在此拒绝），错误体附 `credit_yuan` / `outstanding_yuan`，**整笔拒绝、不登记退付单、不留记录**；
 - `payout_empty_account`：账户尚无已入账凭证，没有可退付的信用；
@@ -1589,6 +1765,15 @@ jq -c '{dispatch, plan_snapshot, audit_tolerance_kwh,
 - `invalid_input`：收款单号为空 / 超长等请求体非法；
 - 同账户同单号**重复冲正不报错**：返回 `result=deduped` 的首次冲正冻结回执。
 
+账户间信用划转接口（`POST /account-transfers`；`transfer_no_conflict` 为 **HTTP 409**，其余为 422）：
+
+- `transfer_same_account`：来源账户与目标账户相同，整笔拒绝、双方不留流水；
+- `transfer_account_no_ledger`：来源（`side=from`）或目标（`side=to`）账户尚无已入账凭证，错误体附 `account_id` / `side`，整笔拒绝、双方不留流水；
+- `transfer_exceeds_credit`：划转额超过来源当前信用（来源没有信用时任何正金额也在此拒绝），错误体附来源 `from_credit_yuan` / `from_outstanding_yuan`，**整笔拒绝、不登记划转单、双方不留流水**；
+- `transfer_amount_not_positive`：亚微级金额（6 位小数舍入后为 0），不允许 0 元划转；
+- `transfer_no_conflict`（409）：同一划转单号已登记但**金额不同或来源 / 目标账户不同**，错误体附首次登记的 `from_account_id` / `to_account_id` / `amount_yuan`，本次不写入；同号同双方同金额不报错，返回 `result=deduped` 的首次冻结回执；
+- `invalid_input`：金额非正（必须 > 0）、划转单号或账户 ID 为空 / 超长等请求体非法。
+
 注意：已执行动作**偏离旧计划**本身不构成拒绝——只要实测记录自洽（含相邻记录 SOC 衔接），偏离只作为 `soc_gap_*` 与各费用差额信息返回，续排一律以实测末态为准。
 
 ## 测试
@@ -1598,4 +1783,4 @@ pip install pytest httpx
 pytest tests/ -q
 ```
 
-覆盖谷充峰放套利、效率损耗与衰减费核算、末端 SOC 约束、禁止倒送、光伏免费充电、无解诊断、各类非法输入，以及峰值与字典序两级破平局；遥测审计部分覆盖自洽记录通过、三类残差（电芯能量 / 购电量 / SOC 衔接）越限标记、容差边界（等于容差不判异常）、光伏盈余购电截断，以及容量 / 效率 / 容差 / 测量值的非法输入拦截。结算部分覆盖：全部有效全额结算（含容差内购电偏差计入费用差额、实测吞吐量衰减费核算、预测偏差场景）、审计异常与 SOC 断点起的前缀冻结、断点与衔接异常的区分、计划快照（periods / summary / 动作）篡改拒绝、dispatch 输入与快照不匹配拒绝、长度不符与无有效区间拒绝、重算无解传播，以及既有三个接口行为不变。续排部分覆盖：原时间轴已执行/待执行明细与费用口径、余段电价变化后的最优重排、实测偏离旧计划但自洽时保留原记录并从末态重排、容差内表计偏差照实计费、余段输入与快照的结算接口端到端衔接（含余段仅一段）、首态 SOC 容差边界（等于容差通过、超出拒绝），以及前缀审计异常、首态未接原初值、末态非 0.1kWh 网格、余段末端约束不可达（`infeasible`）、快照篡改、长度不符、空前缀/全周期前缀、非法容差/测量值/余段预测等各类整体拒绝。执行会话部分覆盖：创建时快照重算核对（含篡改、原输入无解）、分批追加的首批/后续批首态衔接（含容差边界）、动作偏离计划但自洽仍接受、下标跳跃与越界整批不入库且无副作用、批内核电芯能量/购电量/SOC 衔接异常整批拒绝、同起点原样重试返回 deduped、同起点内容不同（含部分重叠）返回 409、并发同起点上报只有一份生效（多线程）、查询返回原计划与连续已确认记录及下一下标、未完成前缀端到端续排、满期记录端到端结算、按同一路径重建存储模拟进程重启后记录仍在且可续报、空批/负值/SOC 超容量等非法输入拦截，以及既有四个接口行为不变。计量表更正部分覆盖：修订号 0 查询即原始台账且结算请求可直接用、首次更正在当前版本上整段重核并原子落盘（乱序提交按下标落位、未指定时段保持原值）、后续修订叠加与改回原值后差异下标清空、期望修订号过期返回 409 及当前号、下标重复/越界整次拒绝并点名下标、电芯能量/购电量失衡与相邻 SOC 断点（含只改中段不修衔接链）整次拒绝且已有修订不变、首态对原初始 SOC 的锚点核对与容差边界、替换记录负值/SOC 超容量/空变更等非法输入、未满期拒绝更正与查询、未知会话 404、更正不改写最初上报证据且批次重试仍 deduped 并保持冻结回执、修订台账端到端提交现有结算接口（修订口径计费、原始口径不受影响）、按同一路径重建存储模拟重启后修订仍可查询并在当前号上继续更正（旧号冲突）、并发同期望修订号只有一份生效（多线程），以及会话详情暴露当前修订号且列表口径不变。逐版结算凭证部分覆盖：修订号 0 首张凭证对最初上报记录全额结算且冻结的结算报告与现有结算接口逐字段一致、修订后应补/应退/无差额三档计费（含 t1 购电调整的费用传导与谷时改读数不影响费用）、差额相对最近一张已出凭证从而可跳过未出单的中间修订、同一修订号重试原样返回冻结凭证（result=existing，voucher_id/出单时间/计费栏/台账不变）且即使后续修订继续推进也不受影响、未出单的过期中间修订与超前修订均返回 409 voucher_revision_conflict 及当前号且不写入、台账只能结算有效前缀（voucher_partial_settled，附首异常下标与已结算段数）与首条即断点（no_valid_interval）均整次拒绝且凭证表为空、修复台账后可对新修订号正常出单、未满期出单/查询 422、未知会话 404、负修订号 422、按出单次序列表与当前修订待出单状态（voucher_revisions/next_revision_settled）、重启后凭证次序与冻结内容仍在且重试仍幂等并可继续出单（序号接续）、旧库自动补建凭证表、同修订多线程并发出单恰好一份落盘其余 existing、出单与更正多轮并发交错下凭证永远冻结最初台账或出单 409 而无部分数据，以及原会话、批次重试、修订查询与现有结算接口行为不变。家庭应收台账部分覆盖：计费栏入账方向与余额可负、从首张起连续入账与同批补齐前序、不存在/跳号/跨账户/批内与历史重复的整批拒绝、整批原子性、多会话汇聚与按入账次序查询、并发同凭证只有一批成功与不同凭证串行一致、更正/重试不动旧入账、重启后仍在与旧库自动补建/补列迁移。账户收款部分覆盖：应退池按原入账顺序抵减未付清正额凭证（与入账先后无关、现金核销优先受保护）、抵减剩余形成信用及信用抵后续应补、收款 FIFO 逐凭证分配与跨凭证部分付清、逐凭证 before/after 尚欠与累计实收快照、超过当前应付（含只有信用、无台账账户）整笔拒绝且收款主行与核销均不留流水、金额非正/单号为空或超长拦截、同单号同账户同金额重试返回首次冻结回执（result=deduped，即使后来入账新凭证也不漂移）、同单号换金额与跨账户使用返回 409 且不写入、后续补退不改写旧收款分配只改变最新尚欠/信用、收款记录按收款次序且首收冻结而账户级头寸最新、同单号多线程并发恰好一笔 received 其余 deduped、不同单号并发串行合计恰好付清且不重复核销、按同一路径重建存储模拟重启后收款与核销仍在、重试幂等且序号接续、旧库自动补建收款两表，以及原入账、出单、会话查询接口行为不变。信用退付部分覆盖：退付只动信用（退付后台账与收款查询的当前信用同步扣除、逐凭证尚欠/已收款与旧收款回执不变）、等于信用的边界退付与退完后任何正金额拒绝、超过当前信用整笔拒绝且不留记录（附当前信用/尚欠）、无台账账户与有台账但无信用账户的拒绝、非正金额/亚微级金额/单号为空或超长拦截、退付不改变未付凭证的尚欠（应退池扣除退付后仍全额覆盖既有抵减）、后续应补在退付后成为最新尚欠（已退付信用不回补）、后续应退重新形成信用可继续退付（序号接续）、同单号同账户同金额重试返回首次冻结回执（result=deduped，即使后来入账新凭证也不漂移）、同单号换金额与跨账户使用返回 409 且不写入、旧退付回执在后续补退后保持冻结而账户级头寸最新、退付记录按退付次序且首付冻结、同单号多线程并发恰好一笔 paid 其余 deduped、不同单号并发不会超额退付且累计退付恰为各笔之和（序号连续）、按同一路径重建存储模拟重启后退付记录与信用扣除仍在、重试幂等且序号接续、旧库自动补建退付表、全 API 链路（出单→入账→收款→更正出应退→入账→退付）口径一致，以及既有收款核销与入账行为不受退付影响。收款冲正部分覆盖：整笔冲正后原收款/逐凭证分配/首收回执保留且收款查询展示冲正状态（reversed/reversed_at）、被冲正收款不再计入有效实收，台账明细逐凭证已收、账户累计实收与台账/收款/退付查询的当前尚欠、信用按有效收款+已记应退+已付退付重算（含应退池重抵与信用回落、已付退付不变），冲正回执含金额/时间/冲正后头寸，重复冲正返回首次冻结回执（deduped，后续新业务不漂移），原单不存在 404 与账户不符 409 均不留冲正记录且头寸不变，原单号重试收款仍返回首次收款回执且换金额仍 409，后续新收款按重算后尚欠 FIFO 补进缺口且超过重算后尚欠仍整笔拒绝，已发生的后续收款分配不回填，冲正列表按冲正次序且内容为首次冻结值、账户级头寸最新，同一笔收款多线程并发冲正只有一笔生效（其余 deduped）、冲正与新收款并发串行一致，按同一路径重建存储模拟重启后冲正记录与冲正状态仍在、可继续冲正（序号接续），旧库自动补建冲正表，以及既有收款/退付/入账/出单接口行为不变。
+覆盖谷充峰放套利、效率损耗与衰减费核算、末端 SOC 约束、禁止倒送、光伏免费充电、无解诊断、各类非法输入，以及峰值与字典序两级破平局；遥测审计部分覆盖自洽记录通过、三类残差（电芯能量 / 购电量 / SOC 衔接）越限标记、容差边界（等于容差不判异常）、光伏盈余购电截断，以及容量 / 效率 / 容差 / 测量值的非法输入拦截。结算部分覆盖：全部有效全额结算（含容差内购电偏差计入费用差额、实测吞吐量衰减费核算、预测偏差场景）、审计异常与 SOC 断点起的前缀冻结、断点与衔接异常的区分、计划快照（periods / summary / 动作）篡改拒绝、dispatch 输入与快照不匹配拒绝、长度不符与无有效区间拒绝、重算无解传播，以及既有三个接口行为不变。续排部分覆盖：原时间轴已执行/待执行明细与费用口径、余段电价变化后的最优重排、实测偏离旧计划但自洽时保留原记录并从末态重排、容差内表计偏差照实计费、余段输入与快照的结算接口端到端衔接（含余段仅一段）、首态 SOC 容差边界（等于容差通过、超出拒绝），以及前缀审计异常、首态未接原初值、末态非 0.1kWh 网格、余段末端约束不可达（`infeasible`）、快照篡改、长度不符、空前缀/全周期前缀、非法容差/测量值/余段预测等各类整体拒绝。执行会话部分覆盖：创建时快照重算核对（含篡改、原输入无解）、分批追加的首批/后续批首态衔接（含容差边界）、动作偏离计划但自洽仍接受、下标跳跃与越界整批不入库且无副作用、批内核电芯能量/购电量/SOC 衔接异常整批拒绝、同起点原样重试返回 deduped、同起点内容不同（含部分重叠）返回 409、并发同起点上报只有一份生效（多线程）、查询返回原计划与连续已确认记录及下一下标、未完成前缀端到端续排、满期记录端到端结算、按同一路径重建存储模拟进程重启后记录仍在且可续报、空批/负值/SOC 超容量等非法输入拦截，以及既有四个接口行为不变。计量表更正部分覆盖：修订号 0 查询即原始台账且结算请求可直接用、首次更正在当前版本上整段重核并原子落盘（乱序提交按下标落位、未指定时段保持原值）、后续修订叠加与改回原值后差异下标清空、期望修订号过期返回 409 及当前号、下标重复/越界整次拒绝并点名下标、电芯能量/购电量失衡与相邻 SOC 断点（含只改中段不修衔接链）整次拒绝且已有修订不变、首态对原初始 SOC 的锚点核对与容差边界、替换记录负值/SOC 超容量/空变更等非法输入、未满期拒绝更正与查询、未知会话 404、更正不改写最初上报证据且批次重试仍 deduped 并保持冻结回执、修订台账端到端提交现有结算接口（修订口径计费、原始口径不受影响）、按同一路径重建存储模拟重启后修订仍可查询并在当前号上继续更正（旧号冲突）、并发同期望修订号只有一份生效（多线程），以及会话详情暴露当前修订号且列表口径不变。逐版结算凭证部分覆盖：修订号 0 首张凭证对最初上报记录全额结算且冻结的结算报告与现有结算接口逐字段一致、修订后应补/应退/无差额三档计费（含 t1 购电调整的费用传导与谷时改读数不影响费用）、差额相对最近一张已出凭证从而可跳过未出单的中间修订、同一修订号重试原样返回冻结凭证（result=existing，voucher_id/出单时间/计费栏/台账不变）且即使后续修订继续推进也不受影响、未出单的过期中间修订与超前修订均返回 409 voucher_revision_conflict 及当前号且不写入、台账只能结算有效前缀（voucher_partial_settled，附首异常下标与已结算段数）与首条即断点（no_valid_interval）均整次拒绝且凭证表为空、修复台账后可对新修订号正常出单、未满期出单/查询 422、未知会话 404、负修订号 422、按出单次序列表与当前修订待出单状态（voucher_revisions/next_revision_settled）、重启后凭证次序与冻结内容仍在且重试仍幂等并可继续出单（序号接续）、旧库自动补建凭证表、同修订多线程并发出单恰好一份落盘其余 existing、出单与更正多轮并发交错下凭证永远冻结最初台账或出单 409 而无部分数据，以及原会话、批次重试、修订查询与现有结算接口行为不变。家庭应收台账部分覆盖：计费栏入账方向与余额可负、从首张起连续入账与同批补齐前序、不存在/跳号/跨账户/批内与历史重复的整批拒绝、整批原子性、多会话汇聚与按入账次序查询、并发同凭证只有一批成功与不同凭证串行一致、更正/重试不动旧入账、重启后仍在与旧库自动补建/补列迁移。账户收款部分覆盖：应退池按原入账顺序抵减未付清正额凭证（与入账先后无关、现金核销优先受保护）、抵减剩余形成信用及信用抵后续应补、收款 FIFO 逐凭证分配与跨凭证部分付清、逐凭证 before/after 尚欠与累计实收快照、超过当前应付（含只有信用、无台账账户）整笔拒绝且收款主行与核销均不留流水、金额非正/单号为空或超长拦截、同单号同账户同金额重试返回首次冻结回执（result=deduped，即使后来入账新凭证也不漂移）、同单号换金额与跨账户使用返回 409 且不写入、后续补退不改写旧收款分配只改变最新尚欠/信用、收款记录按收款次序且首收冻结而账户级头寸最新、同单号多线程并发恰好一笔 received 其余 deduped、不同单号并发串行合计恰好付清且不重复核销、按同一路径重建存储模拟重启后收款与核销仍在、重试幂等且序号接续、旧库自动补建收款两表，以及原入账、出单、会话查询接口行为不变。信用退付部分覆盖：退付只动信用（退付后台账与收款查询的当前信用同步扣除、逐凭证尚欠/已收款与旧收款回执不变）、等于信用的边界退付与退完后任何正金额拒绝、超过当前信用整笔拒绝且不留记录（附当前信用/尚欠）、无台账账户与有台账但无信用账户的拒绝、非正金额/亚微级金额/单号为空或超长拦截、退付不改变未付凭证的尚欠（应退池扣除退付后仍全额覆盖既有抵减）、后续应补在退付后成为最新尚欠（已退付信用不回补）、后续应退重新形成信用可继续退付（序号接续）、同单号同账户同金额重试返回首次冻结回执（result=deduped，即使后来入账新凭证也不漂移）、同单号换金额与跨账户使用返回 409 且不写入、旧退付回执在后续补退后保持冻结而账户级头寸最新、退付记录按退付次序且首付冻结、同单号多线程并发恰好一笔 paid 其余 deduped、不同单号并发不会超额退付且累计退付恰为各笔之和（序号连续）、按同一路径重建存储模拟重启后退付记录与信用扣除仍在、重试幂等且序号接续、旧库自动补建退付表、全 API 链路（出单→入账→收款→更正出应退→入账→退付）口径一致，以及既有收款核销与入账行为不受退付影响。收款冲正部分覆盖：整笔冲正后原收款/逐凭证分配/首收回执保留且收款查询展示冲正状态（reversed/reversed_at）、被冲正收款不再计入有效实收，台账明细逐凭证已收、账户累计实收与台账/收款/退付查询的当前尚欠、信用按有效收款+已记应退+已付退付重算（含应退池重抵与信用回落、已付退付不变），冲正回执含金额/时间/冲正后头寸，重复冲正返回首次冻结回执（deduped，后续新业务不漂移），原单不存在 404 与账户不符 409 均不留冲正记录且头寸不变，原单号重试收款仍返回首次收款回执且换金额仍 409，后续新收款按重算后尚欠 FIFO 补进缺口且超过重算后尚欠仍整笔拒绝，已发生的后续收款分配不回填，冲正列表按冲正次序且内容为首次冻结值、账户级头寸最新，同一笔收款多线程并发冲正只有一笔生效（其余 deduped）、冲正与新收款并发串行一致，按同一路径重建存储模拟重启后冲正记录与冲正状态仍在、可继续冲正（序号接续），旧库自动补建冲正表，以及既有收款/退付/入账/出单接口行为不变。账户间信用划转部分覆盖：来源信用扣减且不动来源逐凭证尚欠/已收款、目标按入账顺序 FIFO 抵扣未付清正额凭证（跨凭证与部分付清）、剩余转入额叠加目标既有信用形成新信用、转入额不计现金实收（目标 paid_yuan/total_received_yuan 不变、只增 refund_applied_yuan）、台账/收款/退付查询按划转后头寸展示、划转额等于来源信用的边界与超过整笔拒绝（附来源信用/尚欠、双方均不留流水）、两户相同（transfer_same_account）与来源/目标无台账（transfer_account_no_ledger，附 side）拒绝、非正/亚微级金额与单号/账户为空超长拦截、同单号同双方同金额重试返回首次冻结回执（deduped，即使后来两户头寸变化也不漂移）、同单号换金额或换账户返回 409 且不写入、划转记录按全平台落盘先后合并查询划出与划入（role/seq/other_account_id、两侧侧序号独立、冻结快照不漂移、账户级头寸最新、空账户全 0）、划转后收款按新尚欠 FIFO（超额仍拒绝）、剩余转入信用可退付、来源剩余信用限制后续退付、后续应补成为尚欠/后续应退与转入池共同重抵、收款冲正后转入池重新抵扣且信用回落、旧收款/退付/凭证与首次回执不被划转改写、三户链式划转（划入形成的信用可继续划出）、同单号多线程并发恰好一笔 transferred 其余 deduped、不同单号划转与退付并发支用同一笔信用不超额（累计恰为信用之和、两侧序号连续）、按同一路径重建存储模拟重启后划转记录与幂等重试及两侧序号仍在、旧库自动补建划转表，以及无划转头寸口径不变等既有接口行为。
